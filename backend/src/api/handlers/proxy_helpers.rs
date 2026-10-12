@@ -2625,6 +2625,9 @@ pub(crate) enum MemberResolveOutcome<T, E> {
     /// (quarantine hold / scan policy) rejecting an artifact it *does* hold.
     /// Either way it must surface rather than fall through to another member.
     Quarantine(E),
+    /// An upstream failed. Keep trying members, but preserve the failure if
+    /// none can serve; an unavailable upstream does not prove absence.
+    Failure(E),
     /// The member does not have the artifact; try the next by priority.
     Miss,
 }
@@ -2640,6 +2643,7 @@ impl<T, E> MemberResolveOutcome<T, E> {
         match self {
             MemberResolveOutcome::Hit(t) => MemberResolveOutcome::Hit(f(t)),
             MemberResolveOutcome::Quarantine(e) => MemberResolveOutcome::Quarantine(e),
+            MemberResolveOutcome::Failure(e) => MemberResolveOutcome::Failure(e),
             MemberResolveOutcome::Miss => MemberResolveOutcome::Miss,
         }
     }
@@ -12302,6 +12306,166 @@ mod tests {
                 "after the top candidate misses, the highest-priority remaining hit wins"
             ),
             other => panic!("expected Hit(hit-m1), got {other:?}"),
+        }
+    }
+
+    // Regression: a failed remote fetch used to collapse to Miss and then 404.
+    #[tokio::test]
+    async fn upstream_failure_is_preserved_when_other_members_miss() {
+        for failure_first in [true, false] {
+            for unavailable in [false, true] {
+                let members = two_members();
+                let outcome = resolve_members_two_phase(
+                    &members,
+                    |_| async { (MemberCacheClass::NeedsUpstream, None) },
+                    |member| async move {
+                        let error = if (member.key == "m0") == failure_first {
+                            if unavailable {
+                                AppError::ServiceUnavailable("upstream unavailable".into())
+                            } else {
+                                AppError::Storage("HTTP/2 connection failed".into())
+                            }
+                        } else {
+                            AppError::NotFound("not here".into())
+                        };
+                        classify_stream_upstream(Err(error), &member.key, "pkg.tgz")
+                    },
+                )
+                .await;
+                match outcome {
+                    Some(MemberResolveOutcome::Failure(response)) => assert_eq!(
+                        response.status(),
+                        if unavailable {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            StatusCode::BAD_GATEWAY
+                        },
+                    ),
+                    other => panic!("upstream failure must survive the member walk: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_failure_allows_lower_priority_upstream_hit() {
+        let members = two_members();
+        let outcome = resolve_members_two_phase(
+            &members,
+            |_| async { (MemberCacheClass::NeedsUpstream, None) },
+            |member| async move {
+                if member.key == "m0" {
+                    classify_stream_upstream(
+                        Err(AppError::Storage("connection reset".into())),
+                        "m0",
+                        "pkg.tgz",
+                    )
+                } else {
+                    classify_stream_upstream(Ok(empty_stream_result()), "m1", "pkg.tgz")
+                }
+            },
+        )
+        .await;
+        assert!(matches!(outcome, Some(MemberResolveOutcome::Hit(_))));
+    }
+
+    #[tokio::test]
+    async fn upstream_failure_allows_cached_hit_but_preserves_policy_block() {
+        for blocked in [false, true] {
+            let members = two_members();
+            let outcome = resolve_members_two_phase(
+                &members,
+                |member| async move {
+                    if member.key == "m0" {
+                        (MemberCacheClass::NeedsUpstream, None)
+                    } else {
+                        let cached = if blocked {
+                            MemberResolveOutcome::Quarantine(
+                                (StatusCode::FORBIDDEN, "blocked").into_response(),
+                            )
+                        } else {
+                            MemberResolveOutcome::Hit(empty_stream_result())
+                        };
+                        (MemberCacheClass::DefiniteHit, Some(cached))
+                    }
+                },
+                |_| async {
+                    classify_stream_upstream(
+                        Err(AppError::Storage("connection reset".into())),
+                        "m0",
+                        "pkg.tgz",
+                    )
+                },
+            )
+            .await;
+            if blocked {
+                assert!(matches!(outcome, Some(MemberResolveOutcome::Quarantine(_))));
+            } else {
+                assert!(matches!(outcome, Some(MemberResolveOutcome::Hit(_))));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_failure_selection_follows_member_priority() {
+        let members = vec![
+            test_local_member("m0"),
+            test_local_member("m1"),
+            test_local_member("m2"),
+        ];
+        let outcome = resolve_members_two_phase(
+            &members,
+            |_| async { (MemberCacheClass::NeedsUpstream, None) },
+            |member| async move {
+                let error = match member.key.as_str() {
+                    "m0" => AppError::NotFound("absent".into()),
+                    "m1" => {
+                        tokio::task::yield_now().await;
+                        AppError::ServiceUnavailable("unavailable".into())
+                    }
+                    _ => AppError::Storage("connection reset".into()),
+                };
+                classify_stream_upstream(Err(error), &member.key, "pkg.tgz")
+            },
+        )
+        .await;
+        assert!(
+            matches!(outcome, Some(MemberResolveOutcome::Failure(ref response))
+            if response.status() == StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_failure_true_not_found_remains_a_miss() {
+        let members = two_members();
+        let outcome = resolve_members_two_phase(
+            &members,
+            |_| async { (MemberCacheClass::NeedsUpstream, None) },
+            |member| async move {
+                classify_stream_upstream(
+                    Err(AppError::NotFound("absent".into())),
+                    &member.key,
+                    "pkg.tgz",
+                )
+            },
+        )
+        .await;
+        assert!(outcome.is_none());
+        assert_eq!(member_miss_response().status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn upstream_failure_response_classifier_preserves_gateway_errors() {
+        for status in [
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            let outcome =
+                classify_streaming_upstream(Err((status, "upstream failed").into_response()));
+            assert!(
+                matches!(outcome, MemberResolveOutcome::Failure(ref response) if response.status() == status)
+            );
         }
     }
 
