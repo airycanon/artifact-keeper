@@ -246,6 +246,8 @@ tonic-prost-build.workspace = true
 prost-build.workspace = true
 
 [dev-dependencies]
+# Exercise the HTTP/2 transport regression with a local protocol peer.
+h2 = "0.4"
 tokio-test = "0.4"
 axum-test = "19"
 wiremock = "0.6"
