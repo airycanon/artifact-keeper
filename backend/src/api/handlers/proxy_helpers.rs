@@ -2633,7 +2633,7 @@ pub(crate) enum MemberResolveOutcome<T, E> {
 }
 
 impl<T, E> MemberResolveOutcome<T, E> {
-    /// Transform the success payload, leaving `Quarantine` / `Miss` untouched.
+    /// Transform the success payload, leaving errors and misses untouched.
     ///
     /// Lets a resolver reuse the shared `classify_*` helpers (which produce a
     /// bare payload) when its own `T` is a tuple carrying extra per-member data
@@ -2719,20 +2719,20 @@ pub(crate) const MAX_VIRTUAL_FANOUT: usize = 16;
 /// [`MemberCacheClass::NeedsUpstream`] AND could still outrank the
 /// highest-priority Pass-1 hit (see [`upstream_candidate_indices`]). The winner
 /// is the first member in priority order that produced a hit or a quarantine
-/// block; `None` means every member missed. The caller maps that to its own
-/// success/`NOT_FOUND` response.
+/// block. Failures allow fallback, but if no member can serve, the highest-
+/// priority failure is returned. `None` means every member genuinely missed.
 ///
 /// Concurrency / fan-out semantics (the load-bearing tradeoff):
 /// * The **warm path stays upstream-free**: when a high-priority member is a
 ///   Pass-1 cache hit, no member behind it is even a candidate, so Pass 2 makes
 ///   no upstream calls at all.
 /// * **Confirm-top-first**: Pass 2 first resolves the *highest-priority*
-///   candidate alone. If it is a non-miss it is the overall winner (nothing
+///   candidate alone. If it is a hit or block it is the overall winner (nothing
 ///   outranks it) and we return WITHOUT launching any other upstream request.
 ///   So a cold first request for an artifact the top candidate holds — the
 ///   common cold-*positive* case — costs exactly ONE upstream request, not one
 ///   per member.
-/// * Only when the top candidate **misses** are the remaining candidates driven
+/// * Only when the top candidate **misses or fails** are the remaining candidates driven
 ///   concurrently — the cold-*negative* (artifact missing everywhere) and
 ///   cold-positive-on-a-lower-member cases. Here every remaining candidate's
 ///   `upstream` future is launched at once, so a true negative still resolves in
@@ -2744,8 +2744,8 @@ pub(crate) const MAX_VIRTUAL_FANOUT: usize = 16;
 ///   never polled.
 /// * The remaining-candidate result is finalized in **strict priority order with
 ///   early return**: as soon as the highest-priority remaining candidate that
-///   resolves to a non-miss is known (all higher-priority ones having resolved
-///   to a miss), that outcome wins and the in-flight losers are dropped
+///   resolves to a hit or block is known (all higher-priority ones having resolved
+///   to a miss or failure), that outcome wins and the in-flight losers are dropped
 ///   (cancelled). A fast high-priority hit is never delayed by a slow
 ///   low-priority member. The remaining-candidate fan-out is naturally bounded:
 ///   it only includes candidates ranked above the first Pass-1 cache hit, minus
@@ -2802,20 +2802,21 @@ where
     let upstream = &upstream;
 
     // Pass 2, step 1 — confirm the HIGHEST-priority candidate on its own. If it
-    // produces a non-miss it is the overall winner (nothing outranks it), so we
+    // produces a hit or block it is the overall winner (nothing outranks it), so we
     // return WITHOUT launching any other upstream request. This eliminates the
     // cold-positive fan-out for the common "top member has it" case (#2069): a
     // first request for an artifact the top remote member holds costs exactly
     // one upstream request, not one per member.
-    let first_outcome = upstream(&members[first]).await;
-    if !matches!(first_outcome, MemberResolveOutcome::Miss) {
-        return Some(first_outcome);
-    }
+    let mut failure = match upstream(&members[first]).await {
+        MemberResolveOutcome::Failure(error) => Some(MemberResolveOutcome::Failure(error)),
+        MemberResolveOutcome::Miss => None,
+        winner => return Some(winner),
+    };
     if rest.is_empty() {
-        return pass1_winner;
+        return pass1_winner.or(failure);
     }
 
-    // Pass 2, step 2 — the top candidate missed, so the remaining candidates are
+    // Pass 2, step 2 — the top candidate missed or failed; remaining candidates are
     // driven concurrently (a cold negative/miss fans out here), finalizing in
     // strict priority order with early return + cancellation of losers.
     // `rest` is ascending by priority, so a candidate's position in `rest` is
@@ -2840,27 +2841,36 @@ where
 
     let mut buffer: Vec<Option<MemberResolveOutcome<T, E>>> =
         (0..rest.len()).map(|_| None).collect();
-    // `next` is the lowest-priority-rank candidate whose outcome is not yet
-    // decided to be a miss; once `buffer[next]` is a known non-miss it wins.
+    // `next` is the first candidate not yet finalized in priority order.
+    // Misses and failures advance it; a hit or policy block wins.
     let mut next = 0usize;
 
     while let Some((rank, outcome)) = running.next().await {
         buffer[rank] = Some(outcome);
         // Advance over a contiguous run of already-resolved candidates.
         while next < buffer.len() {
-            match buffer[next] {
+            match buffer[next].take() {
                 Some(MemberResolveOutcome::Miss) => next += 1,
+                Some(MemberResolveOutcome::Failure(error)) => {
+                    // Consume failures in member priority order, not completion
+                    // order. A later hit or policy block still wins.
+                    if failure.is_none() {
+                        failure = Some(MemberResolveOutcome::Failure(error));
+                    }
+                    next += 1;
+                }
                 // A higher-priority candidate is still pending: must wait.
                 None => break,
-                // First non-miss in priority order wins; dropping `running`
+                // First hit or block in priority order wins; dropping `running`
                 // cancels the remaining in-flight upstream futures.
-                Some(_) => return buffer[next].take(),
+                Some(winner) => return Some(winner),
             }
         }
     }
 
-    // Every candidate resolved to a miss → fall back to the best Pass-1 hit.
-    pass1_winner
+    // Cached hits/blocks take precedence over failures. Only an all-miss walk
+    // without any failure may become a 404 at the handler boundary.
+    pass1_winner.or(failure)
 }
 
 /// Map a cache-only proxy probe (`streaming_cached_artifact_by_path`) to a
@@ -2899,8 +2909,8 @@ pub(crate) fn classify_cache_probe<T, E>(
 
 /// Map a Remote member's buffered/streaming upstream fetch result to its final
 /// [`MemberResolveOutcome`] (#2069). A Package-Age-Policy quarantine block
-/// (#1770) surfaces as [`MemberResolveOutcome::Quarantine`]; any other error is
-/// an ordinary miss.
+/// (#1770) surfaces as [`MemberResolveOutcome::Quarantine`]. Only NotFound is
+/// a miss; other errors are retained if no member can serve the artifact.
 pub(crate) fn classify_stream_upstream(
     result: Result<StreamingFetchResult, crate::error::AppError>,
     member_key: &str,
@@ -2911,7 +2921,8 @@ pub(crate) fn classify_stream_upstream(
         Err(e) if is_quarantine_block(&e) => {
             MemberResolveOutcome::Quarantine(map_proxy_error(member_key, path, e))
         }
-        Err(_) => MemberResolveOutcome::Miss,
+        Err(AppError::NotFound(_)) => MemberResolveOutcome::Miss,
+        Err(e) => MemberResolveOutcome::Failure(map_proxy_error(member_key, path, e)),
     }
 }
 
@@ -2995,7 +3006,8 @@ pub(crate) fn classify_streaming_local(
 
 /// Map a Remote member's streaming upstream fetch (already mapped to a
 /// [`Response`] by [`proxy_fetch_streaming_member`]) to its final outcome
-/// (#2069). A quarantine 409/403 surfaces; any other error Response is a miss.
+/// (#2069). A quarantine 409/403 surfaces immediately; other failures allow
+/// fallback but must not turn into a 404 if every member fails or misses.
 pub(crate) fn classify_streaming_upstream(
     result: Result<Response, Response>,
 ) -> MemberResolveOutcome<Response, Response> {
@@ -3004,7 +3016,8 @@ pub(crate) fn classify_streaming_upstream(
         Err(resp) if is_member_policy_block_response(&resp) => {
             MemberResolveOutcome::Quarantine(resp)
         }
-        Err(_) => MemberResolveOutcome::Miss,
+        Err(resp) if resp.status() == StatusCode::NOT_FOUND => MemberResolveOutcome::Miss,
+        Err(resp) => MemberResolveOutcome::Failure(resp),
     }
 }
 
@@ -3268,7 +3281,9 @@ where
             }
             Ok(result)
         }
-        Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
+        Some(
+            MemberResolveOutcome::Quarantine(response) | MemberResolveOutcome::Failure(response),
+        ) => Err(response),
         _ => Err(member_miss_response()),
     }
 }
@@ -3389,8 +3404,8 @@ async fn record_virtual_serve(
 /// behaviour: it also returned on the first `Ok`.
 ///
 /// Errors during a Remote member's streaming fetch (upstream 404,
-/// connection failure, etc.) move on to the next member, exactly as
-/// the buffered path did with `proxy_fetch`. Local-member failures
+/// connection failure, etc.) move on to the next member. If no member serves,
+/// the highest-priority upstream failure is returned instead of a 404. Local-member failures
 /// (artifact missing on this member) also fall through.
 ///
 /// Caller supplies the per-format `default_content_type` (used when
@@ -3546,7 +3561,9 @@ where
             record_virtual_serve(&state.db, proxy_service, &origin, path, ctx, true).await;
             Ok(response)
         }
-        Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
+        Some(
+            MemberResolveOutcome::Quarantine(response) | MemberResolveOutcome::Failure(response),
+        ) => Err(response),
         _ => Err(member_miss_response()),
     }
 }
@@ -3723,7 +3740,9 @@ where
         // `proxy_fetch`-then-continue behaviour). Handle it explicitly anyway so
         // that intent is enforced: if metadata quarantine surfacing is ever
         // added, the 409/403 propagates instead of silently collapsing to 404.
-        Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
+        Some(
+            MemberResolveOutcome::Quarantine(response) | MemberResolveOutcome::Failure(response),
+        ) => Err(response),
         _ => Err((
             StatusCode::NOT_FOUND,
             "Metadata not found in any member repository",
@@ -12348,6 +12367,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upstream_failure_single_remote_is_not_a_not_found() {
+        let members = vec![test_local_member("only-remote")];
+        let outcome = resolve_members_two_phase(
+            &members,
+            |_| async { (MemberCacheClass::NeedsUpstream, None) },
+            |_| async {
+                classify_stream_upstream(
+                    Err(AppError::Storage("HTTP/2 GOAWAY".into())),
+                    "remote",
+                    "pkg.tgz",
+                )
+            },
+        )
+        .await;
+        assert!(
+            matches!(outcome, Some(MemberResolveOutcome::Failure(ref response))
+            if response.status() == StatusCode::BAD_GATEWAY)
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_failure_in_fanout_allows_hit_or_policy_block() {
+        for blocked in [false, true] {
+            let members = vec![
+                test_local_member("m0"),
+                test_local_member("m1"),
+                test_local_member("m2"),
+            ];
+            let outcome = resolve_members_two_phase(
+                &members,
+                |_| async { (MemberCacheClass::NeedsUpstream, None) },
+                |member| async move {
+                    let result = match member.key.as_str() {
+                        "m0" => Err(AppError::NotFound("absent".into())),
+                        "m1" => Err(AppError::Storage("connection reset".into())),
+                        _ if blocked => Err(AppError::Conflict("held".into())),
+                        _ => Ok(empty_stream_result()),
+                    };
+                    classify_stream_upstream(result, &member.key, "pkg.tgz")
+                },
+            )
+            .await;
+            if blocked {
+                assert!(
+                    matches!(outcome, Some(MemberResolveOutcome::Quarantine(ref response))
+                    if response.status() == StatusCode::CONFLICT)
+                );
+            } else {
+                assert!(matches!(outcome, Some(MemberResolveOutcome::Hit(_))));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn upstream_failure_allows_lower_priority_upstream_hit() {
         let members = two_members();
         let outcome = resolve_members_two_phase(
@@ -12625,7 +12698,7 @@ mod tests {
             MemberResolveOutcome::Quarantine(r) => assert_eq!(r.status(), StatusCode::CONFLICT),
             other => panic!("expected Quarantine, got {other:?}"),
         }
-        // Any other error Response is a miss.
+        // An upstream 404 is a miss.
         let gone = Err((StatusCode::NOT_FOUND, "gone").into_response());
         match classify_streaming_upstream(gone) {
             MemberResolveOutcome::Miss => {}
