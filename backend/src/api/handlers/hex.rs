@@ -1175,7 +1175,9 @@ async fn list_names(
             state.proxy_service.as_deref(),
             repo.id,
             "names",
-            |bytes, _member_key| async move { parse_upstream_names(&bytes) },
+            |bytes, member_key| async move {
+                parse_member_document(&bytes, &member_key, "names", parse_upstream_names)
+            },
         )
         .await?;
         for (_key, remote_names) in remote_results.documents {
@@ -1337,7 +1339,9 @@ async fn list_versions(
             state.proxy_service.as_deref(),
             repo.id,
             "versions",
-            |bytes, _member_key| async move { parse_upstream_versions(&bytes) },
+            |bytes, member_key| async move {
+                parse_member_document(&bytes, &member_key, "versions", parse_upstream_versions)
+            },
         )
         .await?;
         for (_key, remote_versions) in remote_results.documents {
@@ -1561,12 +1565,40 @@ async fn query_local_member_versions(
     Ok(packages)
 }
 
+/// Parse one Remote member's `/names` or `/versions` body for a virtual merge.
+///
+/// A member backed by the real registry (`repo.hex.pm`) serves a gzipped,
+/// signed protobuf there, not the JSON this merge reads (#4629). It publishes
+/// no JSON document at all, so it contributes nothing, exactly like a member
+/// that answers 404. Any other body that does not parse still fails the merge
+/// naming the member (#4192), or is reported missing when the virtual allows
+/// partial merges.
+#[allow(clippy::result_large_err)]
+fn parse_member_document<T: Default>(
+    bytes: &[u8],
+    member_key: &str,
+    resource: &str,
+    parse: fn(&[u8]) -> Result<T, Response>,
+) -> Result<T, Response> {
+    match parse(bytes) {
+        Ok(document) => Ok(document),
+        Err(_) if hex_registry::is_registry_resource(bytes) => {
+            info!(
+                member = member_key,
+                resource,
+                "virtual hex member serves the signed registry, not JSON; it contributes nothing to the merge"
+            );
+            Ok(T::default())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Parse an upstream JSON names response.
 ///
 /// Artifact Keeper hex repos return a JSON array of strings: `["phoenix", "ecto"]`.
-/// If the upstream returns non-JSON (e.g. hex.pm's signed protobuf), parsing
-/// fails and `collect_virtual_metadata` fails the merge naming that member
-/// (#4192), or reports it as missing when the virtual allows partial merges.
+/// A body that is not JSON is an error here; [`parse_member_document`] decides
+/// whether that is a registry member contributing nothing or a merge failure.
 #[allow(clippy::result_large_err)]
 fn parse_upstream_names(bytes: &[u8]) -> Result<Vec<String>, Response> {
     serde_json::from_slice::<Vec<String>>(bytes).map_err(|_| {
@@ -3062,6 +3094,62 @@ mod tests {
         ];
         let result = parse_upstream_names(&data);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_member_document (#4629)
+    // -----------------------------------------------------------------------
+
+    fn hexpm_registry_blob() -> Vec<u8> {
+        let payload = hex_registry::encode_names_payload("hexpm", &[]);
+        hex_registry::signed_gzip(payload, vec![0u8; 256]).unwrap()
+    }
+
+    #[test]
+    fn test_parse_member_document_registry_member_contributes_no_names_4629() {
+        let names = parse_member_document(
+            &hexpm_registry_blob(),
+            "hexpm-remote",
+            "names",
+            parse_upstream_names,
+        )
+        .expect("a repo.hex.pm member must not fail the merge");
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn test_parse_member_document_registry_member_contributes_no_versions_4629() {
+        let versions = parse_member_document(
+            &hexpm_registry_blob(),
+            "hexpm-remote",
+            "versions",
+            parse_upstream_versions,
+        )
+        .expect("a repo.hex.pm member must not fail the merge");
+        assert!(versions.is_empty());
+    }
+
+    #[test]
+    fn test_parse_member_document_still_merges_json_members_4629() {
+        let names = parse_member_document(
+            br#"["phoenix","ecto"]"#,
+            "ak-remote",
+            "names",
+            parse_upstream_names,
+        )
+        .unwrap();
+        assert_eq!(names, vec!["phoenix", "ecto"]);
+    }
+
+    #[test]
+    fn test_parse_member_document_unparseable_body_still_fails_the_merge_4192() {
+        let result = parse_member_document(
+            b"<html>502 Bad Gateway</html>",
+            "broken-remote",
+            "names",
+            parse_upstream_names,
+        );
+        assert_eq!(result.unwrap_err().status(), StatusCode::BAD_GATEWAY);
     }
 
     // -----------------------------------------------------------------------
